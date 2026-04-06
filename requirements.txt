@@ -7,6 +7,6 @@ numpy
 matplotlib
 shap>=0.45.0
 psutil>=5.9.8
-pywin32>=306
+pywin32>=306; platform_system=="Windows"
 pynput>=1.7.7
 requests>=2.31.0
