@@ -66,7 +66,7 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = BASE_DIR / "tracker_local.db"
 LOCAL_JSON_PATH = BASE_DIR / "tracker_predictions.jsonl"
-DEFAULT_API_BASE = "https://devora.onrender.com"
+DEFAULT_API_BASE = "https://devora-backend-bo7f.onrender.com/"
 LOGGER = logging.getLogger("tracker")
 UNKNOWN_WINDOW_INFO: tuple[str, str, int | None] = ("Unknown", "Unknown Window", None)
 _LAST_WINDOW_INFO: tuple[str, str, int | None] = UNKNOWN_WINDOW_INFO
