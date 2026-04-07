@@ -843,84 +843,84 @@ def _build_prediction_core(
     return prediction_core
 
 
-def _build_prediction_response(
-    metrics: ProgrammerMetrics,
-    user_id: str | None = None,
-    tracker_id: str | None = None,
-    source: str = "manual",
-) -> PredictionResponse:
-    prediction_core = _build_prediction_core(metrics, user_id=user_id)
-    input_payload = prediction_core["input_payload"]
-    prediction_id = uuid4().hex
-    timestamp = datetime.now(timezone.utc).isoformat()
+# def _build_prediction_response(
+#     metrics: ProgrammerMetrics,
+#     user_id: str | None = None,
+#     tracker_id: str | None = None,
+#     source: str = "manual",
+# ) -> PredictionResponse:
+#     prediction_core = _build_prediction_core(metrics, user_id=user_id)
+#     input_payload = prediction_core["input_payload"]
+#     prediction_id = uuid4().hex
+#     timestamp = datetime.now(timezone.utc).isoformat()
 
-    save_prediction(
-        {
-            **input_payload,
-            "id": prediction_id,
-            "timestamp": timestamp,
-            "user_id": user_id,
-            "predicted_label": prediction_core["productivity_level"],
-            "productivity_score": prediction_core["productivity_score"],
-        }
-    )
+#     save_prediction(
+#         {
+#             **input_payload,
+#             "id": prediction_id,
+#             "timestamp": timestamp,
+#             "user_id": user_id,
+#             "predicted_label": prediction_core["productivity_level"],
+#             "productivity_score": prediction_core["productivity_score"],
+#         }
+#     )
 
-    latest_activity = _get_cached_latest_activity_log()
-    event_payload = {
-        "id": prediction_id,
-        "timestamp": timestamp,
-        "source": source,
-        "user_id": user_id,
-        "tracker_id": tracker_id,
-        "productivity_level": prediction_core["productivity_level"],
-        "productivity_score": prediction_core["productivity_score"],
-        "explanation": prediction_core["explanation"],
-        "advice": prediction_core["advice"],
-        "shap_local_plot_url": prediction_core["shap_local_plot_url"],
-        "probabilities": prediction_core["probabilities"],
-        "features": input_payload,
-        "feature_importance": prediction_core["feature_importance"],
-        "feature_contributions": prediction_core["feature_contributions"],
-        "personalization": prediction_core["personalization"],
-        "latest_activity": latest_activity,
-        "app_usage": (latest_activity or {}).get("app_usage", {}),
-    }
-    historical_events = _get_cached_recent_prediction_events(limit=60, user_id=user_id)
-    event_payload["personal_insight"] = generate_comparative_insights(event_payload, historical_events)
-    recent_events = [*historical_events, event_payload][-60:]
-    event_payload["temporal_insight"] = generate_temporal_insights(recent_events)
-    event_payload["pattern_insight"] = generate_behavioral_patterns(recent_events)
-    event_payload["proactive"] = generate_proactive_alerts(
-        {
-            "features": input_payload,
-            "app_usage": event_payload["app_usage"],
-            "temporal_insight": event_payload["temporal_insight"],
-            "timestamp": timestamp,
-        },
-        [*historical_events, event_payload][-10:],
-        event_payload["pattern_insight"],
-    )
-    event_payload["coaching"] = generate_coaching_feedback(event_payload, historical_events)
-    save_prediction_event(event_payload)
-    _invalidate_runtime_caches(user_id)
+#     latest_activity = _get_cached_latest_activity_log()
+#     event_payload = {
+#         "id": prediction_id,
+#         "timestamp": timestamp,
+#         "source": source,
+#         "user_id": user_id,
+#         "tracker_id": tracker_id,
+#         "productivity_level": prediction_core["productivity_level"],
+#         "productivity_score": prediction_core["productivity_score"],
+#         "explanation": prediction_core["explanation"],
+#         "advice": prediction_core["advice"],
+#         "shap_local_plot_url": prediction_core["shap_local_plot_url"],
+#         "probabilities": prediction_core["probabilities"],
+#         "features": input_payload,
+#         "feature_importance": prediction_core["feature_importance"],
+#         "feature_contributions": prediction_core["feature_contributions"],
+#         "personalization": prediction_core["personalization"],
+#         "latest_activity": latest_activity,
+#         "app_usage": (latest_activity or {}).get("app_usage", {}),
+#     }
+#     historical_events = _get_cached_recent_prediction_events(limit=60, user_id=user_id)
+#     event_payload["personal_insight"] = generate_comparative_insights(event_payload, historical_events)
+#     recent_events = [*historical_events, event_payload][-60:]
+#     event_payload["temporal_insight"] = generate_temporal_insights(recent_events)
+#     event_payload["pattern_insight"] = generate_behavioral_patterns(recent_events)
+#     event_payload["proactive"] = generate_proactive_alerts(
+#         {
+#             "features": input_payload,
+#             "app_usage": event_payload["app_usage"],
+#             "temporal_insight": event_payload["temporal_insight"],
+#             "timestamp": timestamp,
+#         },
+#         [*historical_events, event_payload][-10:],
+#         event_payload["pattern_insight"],
+#     )
+#     event_payload["coaching"] = generate_coaching_feedback(event_payload, historical_events)
+#     save_prediction_event(event_payload)
+#     _invalidate_runtime_caches(user_id)
 
-    return PredictionResponse(
-        prediction_id=prediction_id,
-        productivity_level=prediction_core["productivity_level"],
-        productivity_score=prediction_core["productivity_score"],
-        probabilities=event_payload["probabilities"],
-        feature_importance=prediction_core["feature_importance"],
-        feature_contributions=prediction_core["feature_contributions"],
-        explanation=prediction_core["explanation"],
-        shap_local_plot_url=prediction_core["shap_local_plot_url"],
-        advice=prediction_core["advice"],
-        personal_insight=event_payload["personal_insight"],
-        temporal_insight=event_payload["temporal_insight"],
-        pattern_insight=event_payload["pattern_insight"],
-        proactive=event_payload["proactive"],
-        coaching=event_payload["coaching"],
-        personalization=prediction_core["personalization"],
-    )
+#     return PredictionResponse(
+#         prediction_id=prediction_id,
+#         productivity_level=prediction_core["productivity_level"],
+#         productivity_score=prediction_core["productivity_score"],
+#         probabilities=event_payload["probabilities"],
+#         feature_importance=prediction_core["feature_importance"],
+#         feature_contributions=prediction_core["feature_contributions"],
+#         explanation=prediction_core["explanation"],
+#         shap_local_plot_url=prediction_core["shap_local_plot_url"],
+#         advice=prediction_core["advice"],
+#         personal_insight=event_payload["personal_insight"],
+#         temporal_insight=event_payload["temporal_insight"],
+#         pattern_insight=event_payload["pattern_insight"],
+#         proactive=event_payload["proactive"],
+#         coaching=event_payload["coaching"],
+#         personalization=prediction_core["personalization"],
+#     )
 
 
 def _predict_summary(metrics: ProgrammerMetrics, user_id: str | None = None) -> dict[str, Any]:
