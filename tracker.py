@@ -66,7 +66,7 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_DB_PATH = BASE_DIR / "tracker_local.db"
 LOCAL_JSON_PATH = BASE_DIR / "tracker_predictions.jsonl"
-DEFAULT_API_BASE = "https://devora-backend-bo7f.onrender.com"
+DEFAULT_API_BASE = "http://127.0.0.1:8000"
 LOGGER = logging.getLogger("tracker")
 UNKNOWN_WINDOW_INFO: tuple[str, str, int | None] = ("Unknown", "Unknown Window", None)
 _LAST_WINDOW_INFO: tuple[str, str, int | None] = UNKNOWN_WINDOW_INFO
@@ -230,17 +230,20 @@ class LocalTrackerStore:
 class TrackerConfig:
     api_base_url: str = DEFAULT_API_BASE
     sample_interval_seconds: float = 2.0
-    send_interval_seconds: float = 25.0
+    send_interval_seconds: float = 10.0
     idle_threshold_seconds: float = 120.0
     focus_delta_threshold: float = 5.0
     privacy_enabled: bool = True
     tracker_id: str = field(default_factory=lambda: uuid4().hex[:12])
 
+    def __post_init__(self) -> None:
+        self.api_base_url = self.api_base_url.strip().rstrip("/")
+
 
 def _trim_window_title(title: str, enabled: bool) -> str:
     if enabled:
-        return title
-    return "[hidden]"
+        return "[hidden]"
+    return title
 
 
 def _safe_process_name(pid: int | None) -> str:
@@ -440,6 +443,7 @@ def build_snapshot(
     elapsed_seconds: float,
 ) -> tuple[dict[str, Any], float]:
     app_name, window_title, pid = get_active_window_info()
+    visible_window_title = _trim_window_title(window_title, config.privacy_enabled)
     context = analyze_context(app_name, window_title)
     category = categorize_app(app_name, window_title)
     idle_seconds = activity_monitor.get_idle_seconds()
@@ -463,7 +467,7 @@ def build_snapshot(
         "app_display_name": app_name.replace(".exe", ""),
         "category": category,
         "active_window": app_name,
-        "window_title": _trim_window_title(window_title, config.privacy_enabled),
+        "window_title": visible_window_title,
         "context": context,
         "cpu_percent": round(cpu_percent, 2),
         "memory_mb": memory_mb,
@@ -472,7 +476,7 @@ def build_snapshot(
         "input_activity": input_activity,
         "process_metrics": _collect_process_metrics(),
     }
-    update_session_state(state, snapshot, elapsed_seconds)
+    update_session_state(state, snapshot, elapsed_seconds, window_identity=window_title)
     usage_summary = serialize_usage_summary(state, snapshot)
     snapshot.update(
         {
@@ -487,16 +491,21 @@ def build_snapshot(
     return snapshot, cpu_percent
 
 
-def send_json(session: requests.Session, method: str, url: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+def send_json(
+    session: requests.Session,
+    method: str,
+    url: str,
+    payload: dict[str, Any],
+) -> tuple[bool, dict[str, Any] | None]:
     try:
         response = session.request(method=method, url=url, json=payload, timeout=10)
         response.raise_for_status()
         if response.content:
-            return response.json()
-        return None
+            return True, response.json()
+        return True, None
     except requests.RequestException as exc:
-        print(f"[tracker] request failed for {url}: {exc}")
-        return None
+        LOGGER.warning("Tracker sync failed method=%s url=%s error=%s", method, url, exc)
+        return False, None
 
 
 def _build_activity_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -619,14 +628,24 @@ def run_tracker(config: TrackerConfig) -> None:
                 focus_delta_threshold=config.focus_delta_threshold,
             ):
                 activity_payload = _build_activity_payload(latest_snapshot)
-                send_json(session, "POST", f"{config.api_base_url}/activity/logs", activity_payload)
+                activity_synced, _ = send_json(
+                    session,
+                    "POST",
+                    f"{config.api_base_url}/activity/logs",
+                    activity_payload,
+                )
                 predict_payload = {
                     **feature_payload,
                     "tracker_id": config.tracker_id,
                     "source": "tracker",
                 }
-                prediction = send_json(session, "POST", f"{config.api_base_url}/realtime/predict", predict_payload)
-                if prediction:
+                prediction_synced, prediction = send_json(
+                    session,
+                    "POST",
+                    f"{config.api_base_url}/realtime/predict",
+                    predict_payload,
+                )
+                if prediction_synced and prediction:
                     enriched_prediction = {
                         **prediction,
                         "tracker_id": config.tracker_id,
@@ -639,9 +658,10 @@ def run_tracker(config: TrackerConfig) -> None:
                         f"{prediction['productivity_level']} score={prediction['productivity_score']} "
                         f"active_app={latest_snapshot['app_name']}"
                     )
-                last_send_at = now
-                last_sent_snapshot = latest_snapshot
-                last_sent_features = dict(feature_payload)
+                if activity_synced and prediction_synced:
+                    last_send_at = now
+                    last_sent_snapshot = latest_snapshot
+                    last_sent_features = dict(feature_payload)
 
             time.sleep(config.sample_interval_seconds)
     except KeyboardInterrupt:
@@ -654,7 +674,7 @@ def parse_args() -> TrackerConfig:
     parser = argparse.ArgumentParser(description="Devora realtime tracker")
     parser.add_argument("--api-base-url", default=DEFAULT_API_BASE)
     parser.add_argument("--sample-interval", type=float, default=2.0)
-    parser.add_argument("--send-interval", type=float, default=25.0)
+    parser.add_argument("--send-interval", type=float, default=10.0)
     parser.add_argument("--idle-threshold", type=float, default=120.0)
     parser.add_argument("--tracker_id", default=None)
     parser.add_argument("--disable-privacy", action="store_true", help="Send full window titles")

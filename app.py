@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -43,7 +46,7 @@ try:
     from .performance_cache import build_cache_key, create_cache_manager
     from .personalization import clear_user_model_cache, get_personalized_model, update_user_model
     from .proactive_engine import generate_proactive_alerts
-    from .model_training import DATASET_PATH, FEATURES as TRAINING_FEATURES
+    from .model_training import DATASET_PATH, FEATURES as TRAINING_FEATURES, load_model_bundle
     from .retrain_model import MIN_NEW_SAMPLES_FOR_RETRAIN, retrain_model
     from .shap_visuals import STATIC_DIR, generate_global_plot, generate_local_plot
     from .simulation_engine import run_what_if_analysis
@@ -68,7 +71,7 @@ except ImportError:
     from performance_cache import build_cache_key, create_cache_manager
     from personalization import clear_user_model_cache, get_personalized_model, update_user_model
     from proactive_engine import generate_proactive_alerts
-    from model_training import DATASET_PATH, FEATURES as TRAINING_FEATURES
+    from model_training import DATASET_PATH, FEATURES as TRAINING_FEATURES, load_model_bundle
     from retrain_model import MIN_NEW_SAMPLES_FOR_RETRAIN, retrain_model
     from shap_visuals import STATIC_DIR, generate_global_plot, generate_local_plot
     from simulation_engine import run_what_if_analysis
@@ -100,16 +103,48 @@ RECENT_EVENTS_CACHE_TTL_SECONDS = 4
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _resolve_allowed_origins() -> list[str]:
+    configured = os.getenv("DEVORA_ALLOWED_ORIGINS", "").strip()
+    if configured:
+        origins = [origin.strip() for origin in configured.split(",") if origin.strip()]
+        if origins:
+            return origins
+
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ]
+
+
+ALLOWED_ORIGINS = _resolve_allowed_origins()
+ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    try:
+        yield
+    finally:
+        _cleanup_inactive_trackers()
+        for tracker_id in list(active_trackers.keys()):
+            _stop_tracker_process(tracker_id)
+
+
 app = FastAPI(
     title="Devora API",
     description="AI-powered programmer productivity analyzer with continuous learning",
     version="3.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -311,6 +346,12 @@ class TrackingSessionResponse(BaseModel):
     status: str
 
 
+class TrackingSessionStatusResponse(BaseModel):
+    tracker_id: str | None = None
+    started_at: str | None = None
+    status: str
+
+
 class RealtimeOverviewResponse(BaseModel):
     latest_prediction: dict[str, Any] | None = None
     predictions: list[dict[str, Any]]
@@ -406,6 +447,8 @@ def _compact_prediction_event(event: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": event.get("id"),
         "timestamp": event.get("timestamp"),
+        "source": event.get("source"),
+        "tracker_id": event.get("tracker_id"),
         "productivity_level": event.get("productivity_level"),
         "productivity_score": event.get("productivity_score"),
         "features": {
@@ -539,6 +582,7 @@ def get_advice(level: str) -> str:
 
 
 def clear_model_caches() -> None:
+    _load_cached_model_bundle.cache_clear()
     load_explainer.cache_clear()
     generate_global_plot.cache_clear()
     clear_user_model_cache()
@@ -618,8 +662,18 @@ def _predict_with_bundle(bundle: dict[str, Any], input_df: pd.DataFrame) -> dict
     }
 
 
+@lru_cache(maxsize=1)
+def _load_cached_model_bundle() -> dict[str, Any]:
+    bundle = load_model_bundle(MODEL_PATH)
+    if bundle is None:
+        raise FileNotFoundError(
+            f"model.pkl not found at '{MODEL_PATH}'. Run `python model_training.py` first."
+        )
+    return bundle
+
+
 def get_bundle():
-    bundle = load_explainer(MODEL_PATH)
+    bundle = dict(_load_cached_model_bundle())
     if "version" not in bundle:
         bundle["version"] = "v1"
     if "model_name" not in bundle:
@@ -664,6 +718,20 @@ def _run_retraining(force: bool = False) -> dict[str, Any]:
         if result["status"] == "retrained":
             clear_model_caches()
         return result
+    except Exception as exc:
+        LOGGER.exception("Retraining failed")
+        bundle = get_bundle()
+        return {
+            "status": "failed",
+            "old_accuracy": bundle.get("previous_accuracy"),
+            "new_accuracy": bundle.get("accuracy"),
+            "improvement": format_improvement(bundle.get("previous_accuracy"), bundle.get("accuracy")),
+            "version": bundle.get("version", "v1"),
+            "total_training_samples": int(bundle.get("trained_on", 0)),
+            "new_samples": 0,
+            "dataset_composition": bundle.get("dataset_composition", {}),
+            "reason": str(exc),
+        }
     finally:
         _retrain_lock.release()
 
@@ -843,84 +911,95 @@ def _build_prediction_core(
     return prediction_core
 
 
-# def _build_prediction_response(
-#     metrics: ProgrammerMetrics,
-#     user_id: str | None = None,
-#     tracker_id: str | None = None,
-#     source: str = "manual",
-# ) -> PredictionResponse:
-#     prediction_core = _build_prediction_core(metrics, user_id=user_id)
-#     input_payload = prediction_core["input_payload"]
-#     prediction_id = uuid4().hex
-#     timestamp = datetime.now(timezone.utc).isoformat()
+def _build_prediction_response(
+    metrics: ProgrammerMetrics,
+    user_id: str | None = None,
+    tracker_id: str | None = None,
+    source: str = "manual",
+) -> PredictionResponse:
+    prediction_core = _build_prediction_core(metrics, user_id=user_id)
+    input_payload = dict(prediction_core["input_payload"])
+    prediction_id = uuid4().hex
+    timestamp = datetime.now(timezone.utc).isoformat()
 
-#     save_prediction(
-#         {
-#             **input_payload,
-#             "id": prediction_id,
-#             "timestamp": timestamp,
-#             "user_id": user_id,
-#             "predicted_label": prediction_core["productivity_level"],
-#             "productivity_score": prediction_core["productivity_score"],
-#         }
-#     )
+    save_prediction(
+        {
+            **input_payload,
+            "id": prediction_id,
+            "timestamp": timestamp,
+            "user_id": user_id,
+            "predicted_label": prediction_core["productivity_level"],
+            "productivity_score": prediction_core["productivity_score"],
+        }
+    )
 
-#     latest_activity = _get_cached_latest_activity_log()
-#     event_payload = {
-#         "id": prediction_id,
-#         "timestamp": timestamp,
-#         "source": source,
-#         "user_id": user_id,
-#         "tracker_id": tracker_id,
-#         "productivity_level": prediction_core["productivity_level"],
-#         "productivity_score": prediction_core["productivity_score"],
-#         "explanation": prediction_core["explanation"],
-#         "advice": prediction_core["advice"],
-#         "shap_local_plot_url": prediction_core["shap_local_plot_url"],
-#         "probabilities": prediction_core["probabilities"],
-#         "features": input_payload,
-#         "feature_importance": prediction_core["feature_importance"],
-#         "feature_contributions": prediction_core["feature_contributions"],
-#         "personalization": prediction_core["personalization"],
-#         "latest_activity": latest_activity,
-#         "app_usage": (latest_activity or {}).get("app_usage", {}),
-#     }
-#     historical_events = _get_cached_recent_prediction_events(limit=60, user_id=user_id)
-#     event_payload["personal_insight"] = generate_comparative_insights(event_payload, historical_events)
-#     recent_events = [*historical_events, event_payload][-60:]
-#     event_payload["temporal_insight"] = generate_temporal_insights(recent_events)
-#     event_payload["pattern_insight"] = generate_behavioral_patterns(recent_events)
-#     event_payload["proactive"] = generate_proactive_alerts(
-#         {
-#             "features": input_payload,
-#             "app_usage": event_payload["app_usage"],
-#             "temporal_insight": event_payload["temporal_insight"],
-#             "timestamp": timestamp,
-#         },
-#         [*historical_events, event_payload][-10:],
-#         event_payload["pattern_insight"],
-#     )
-#     event_payload["coaching"] = generate_coaching_feedback(event_payload, historical_events)
-#     save_prediction_event(event_payload)
-#     _invalidate_runtime_caches(user_id)
+    latest_activity = _get_cached_latest_activity_log()
+    event_payload = {
+        "id": prediction_id,
+        "timestamp": timestamp,
+        "source": source,
+        "user_id": user_id,
+        "tracker_id": tracker_id,
+        "productivity_level": prediction_core["productivity_level"],
+        "productivity_score": prediction_core["productivity_score"],
+        "explanation": prediction_core["explanation"],
+        "advice": prediction_core["advice"],
+        "shap_local_plot_url": prediction_core["shap_local_plot_url"],
+        "probabilities": prediction_core["probabilities"],
+        "features": input_payload,
+        "feature_importance": prediction_core["feature_importance"],
+        "feature_contributions": prediction_core["feature_contributions"],
+        "personalization": prediction_core["personalization"],
+        "latest_activity": latest_activity,
+        "app_usage": (latest_activity or {}).get("app_usage") or {},
+    }
+    historical_events = _get_cached_recent_prediction_events(limit=60, user_id=user_id)
 
-#     return PredictionResponse(
-#         prediction_id=prediction_id,
-#         productivity_level=prediction_core["productivity_level"],
-#         productivity_score=prediction_core["productivity_score"],
-#         probabilities=event_payload["probabilities"],
-#         feature_importance=prediction_core["feature_importance"],
-#         feature_contributions=prediction_core["feature_contributions"],
-#         explanation=prediction_core["explanation"],
-#         shap_local_plot_url=prediction_core["shap_local_plot_url"],
-#         advice=prediction_core["advice"],
-#         personal_insight=event_payload["personal_insight"],
-#         temporal_insight=event_payload["temporal_insight"],
-#         pattern_insight=event_payload["pattern_insight"],
-#         proactive=event_payload["proactive"],
-#         coaching=event_payload["coaching"],
-#         personalization=prediction_core["personalization"],
-#     )
+    personal_insight = generate_comparative_insights(event_payload, historical_events)
+    timeline_events = [*historical_events, {**event_payload, "personal_insight": personal_insight}][-60:]
+    temporal_insight = generate_temporal_insights(timeline_events)
+    pattern_insight = generate_behavioral_patterns(timeline_events)
+    proactive = generate_proactive_alerts(
+        {
+            "features": input_payload,
+            "app_usage": event_payload["app_usage"],
+            "temporal_insight": temporal_insight,
+            "timestamp": timestamp,
+        },
+        timeline_events[-10:],
+        pattern_insight,
+    )
+
+    enriched_event = {
+        **event_payload,
+        "personal_insight": personal_insight,
+        "temporal_insight": temporal_insight,
+        "pattern_insight": pattern_insight,
+        "proactive": proactive,
+    }
+    coaching = generate_coaching_feedback(enriched_event, historical_events)
+    enriched_event["coaching"] = coaching
+
+    save_prediction_event(enriched_event)
+    _invalidate_runtime_caches(user_id)
+
+    return PredictionResponse(
+        prediction_id=prediction_id,
+        productivity_level=prediction_core["productivity_level"],
+        productivity_score=prediction_core["productivity_score"],
+        probabilities=enriched_event["probabilities"],
+        feature_importance=prediction_core["feature_importance"],
+        feature_contributions=prediction_core["feature_contributions"],
+        explanation=prediction_core["explanation"],
+        shap_local_plot_url=prediction_core["shap_local_plot_url"],
+        advice=prediction_core["advice"],
+        personal_insight=personal_insight,
+        temporal_insight=temporal_insight,
+        pattern_insight=pattern_insight,
+        proactive=proactive,
+        coaching=coaching,
+        personalization=prediction_core["personalization"],
+    )
 
 
 def _predict_summary(metrics: ProgrammerMetrics, user_id: str | None = None) -> dict[str, Any]:
@@ -1026,18 +1105,6 @@ def _build_model_stats_payload() -> dict[str, Any]:
         "version": bundle.get("version", "v1"),
         "dataset_composition": bundle.get("dataset_composition", {}),
     }
-
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    _cleanup_inactive_trackers()
-    for tracker_id in list(active_trackers.keys()):
-        _stop_tracker_process(tracker_id)
 
 
 @app.get("/", tags=["health"])
@@ -1191,6 +1258,19 @@ def create_tracking_session():
         started_at=started_at,
         status="tracking",
     )
+
+
+@app.get("/tracking/session", response_model=TrackingSessionStatusResponse, tags=["realtime"])
+def get_tracking_session():
+    tracker_id, tracker_meta = _get_active_tracker()
+    if tracker_id and tracker_meta:
+        return TrackingSessionStatusResponse(
+            tracker_id=tracker_id,
+            started_at=tracker_meta["started_at"],
+            status="tracking",
+        )
+
+    return TrackingSessionStatusResponse(status="stopped")
 
 
 @app.post("/tracking/stop/{tracker_id}", tags=["realtime"])

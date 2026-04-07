@@ -277,18 +277,32 @@ def train_model(x_train, y_train) -> RandomForestClassifier:
 
 
 def evaluate_model(classifier, x_test, y_test, label_encoder: LabelEncoder):
+    labels = list(range(len(label_encoder.classes_)))
     y_pred = classifier.predict(x_test)
     accuracy = accuracy_score(y_test, y_pred)
 
     print(f"\n[OK] Test Accuracy: {accuracy * 100:.2f}%\n")
-    print(classification_report(y_test, y_pred, target_names=label_encoder.classes_))
-
-    cv_scores = cross_val_score(classifier, x_test, y_test, cv=5)
     print(
-        f"[OK] 5-Fold CV Accuracy: {cv_scores.mean() * 100:.2f}% +/- {cv_scores.std() * 100:.2f}%"
+        classification_report(
+            y_test,
+            y_pred,
+            labels=labels,
+            target_names=label_encoder.classes_,
+            zero_division=0,
+        )
     )
 
-    matrix = confusion_matrix(y_test, y_pred)
+    class_counts = pd.Series(y_test).value_counts()
+    cv_folds = min(5, len(y_test), int(class_counts.min())) if not class_counts.empty else 0
+    if cv_folds >= 2:
+        cv_scores = cross_val_score(classifier, x_test, y_test, cv=cv_folds)
+        print(
+            f"[OK] {cv_folds}-Fold CV Accuracy: {cv_scores.mean() * 100:.2f}% +/- {cv_scores.std() * 100:.2f}%"
+        )
+    else:
+        print("[OK] Cross-validation skipped: insufficient class coverage in evaluation split.")
+
+    matrix = confusion_matrix(y_test, y_pred, labels=labels)
     feature_importances = classifier.feature_importances_
 
     _save_confusion_matrix(matrix, label_encoder)

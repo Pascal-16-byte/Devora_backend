@@ -39,13 +39,42 @@ KNOWN_DOMAIN_ALIASES: dict[str, set[str]] = {
     "zoom": {"zoom", "zoom.us"},
     "meet": {"meet", "meet.google.com", "google meet"},
     "docs": {"docs", "documentation", "readthedocs"},
+    "developer.mozilla": {"developer.mozilla", "developer.mozilla.org", "mdn", "mdn web docs"},
+    "docs.python": {"docs.python", "docs.python.org", "python docs"},
+    "gmail": {"gmail", "gmail.com", "mail.google.com"},
+    "calendar": {"calendar", "calendar.google.com", "google calendar"},
     "netflix": {"netflix", "netflix.com"},
+}
+
+DOMAIN_SUFFIX_ALIASES = {
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "github.com": "github",
+    "gitlab.com": "gitlab",
+    "bitbucket.org": "bitbucket",
+    "chat.openai.com": "chatgpt",
+    "developer.mozilla.org": "developer.mozilla",
+    "docs.python.org": "docs.python",
+    "mail.google.com": "gmail",
+    "gmail.com": "gmail",
+    "calendar.google.com": "calendar",
+    "teams.microsoft.com": "teams",
+    "zoom.us": "zoom",
+    "meet.google.com": "meet",
 }
 
 INTENT_RULES: dict[str, dict[str, set[str]]] = {
     "learning": {
         "app": {"udemy", "coursera", "pluralsight"},
-        "domain": {"youtube", "docs", "readthedocs", "developer.mozilla", "freecodecamp"},
+        "domain": {
+            "youtube",
+            "docs",
+            "readthedocs",
+            "developer.mozilla",
+            "docs.python",
+            "w3schools",
+            "freecodecamp",
+        },
         "strong": {
             "tutorial",
             "course",
@@ -137,7 +166,7 @@ INTENT_RULES: dict[str, dict[str, set[str]]] = {
     },
     "communication": {
         "app": {"slack", "teams", "zoom", "outlook", "mail", "discord", "telegram"},
-        "domain": {"slack", "teams", "zoom", "meet", "gmail", "outlook"},
+        "domain": {"slack", "teams", "zoom", "meet", "gmail", "calendar", "outlook"},
         "strong": {
             "meeting",
             "call",
@@ -175,6 +204,25 @@ def _title_candidates(title: str | None) -> list[str]:
     return candidates or [normalized_title]
 
 
+def _canonicalize_domain(raw_domain: str | None) -> str:
+    normalized_domain = normalize_text(raw_domain).strip(".")
+    if not normalized_domain:
+        return ""
+
+    if normalized_domain in {"localhost", "127.0.0.1"}:
+        return normalized_domain
+
+    for suffix, canonical in DOMAIN_SUFFIX_ALIASES.items():
+        if normalized_domain == suffix or normalized_domain.endswith(f".{suffix}"):
+            return canonical
+
+    labels = [label for label in normalized_domain.split(".") if label]
+    if not labels:
+        return normalized_domain
+
+    return labels[-2] if len(labels) >= 2 else labels[0]
+
+
 def extract_domain_from_title(title: str | None) -> str:
     candidates = _title_candidates(title)
     if not candidates:
@@ -184,19 +232,17 @@ def extract_domain_from_title(title: str | None) -> str:
         url_match = URL_TOKEN_RE.search(candidate)
         if url_match:
             raw_domain = url_match.group(1)
-            if raw_domain in {"localhost", "127.0.0.1"}:
-                return raw_domain
-
-            labels = [label for label in raw_domain.split(".") if label]
-            if labels:
-                return labels[-2] if len(labels) >= 2 else labels[0]
+            canonical_domain = _canonicalize_domain(raw_domain)
+            if canonical_domain:
+                return canonical_domain
 
     for candidate in candidates:
+        normalized_candidate = normalize_text(candidate)
         for canonical, aliases in KNOWN_DOMAIN_ALIASES.items():
-            if any(alias in candidate for alias in aliases):
+            if any(alias in normalized_candidate for alias in aliases):
                 return canonical
 
-    return candidates[0]
+    return _canonicalize_domain(candidates[0])
 
 
 def _collect_matches(text: str, keywords: set[str]) -> list[str]:
@@ -217,6 +263,26 @@ def analyze_context(app_name: str | None, window_title: str | None) -> dict[str,
     normalized_title = normalize_text(window_title)
     domain = extract_domain_from_title(normalized_title)
     combined_text = " ".join(part for part in (normalized_app, normalized_title, domain) if part)
+
+    if domain == "youtube":
+        if any(
+            keyword in combined_text
+            for keyword in ("shorts", "#shorts", "/shorts/", "reels", "montage", "highlights", "gameplay", "meme", "trailer", "funny")
+        ):
+            return {
+                "intent": "distraction",
+                "confidence": 0.9,
+                "reason": "youtube short-form or entertainment context",
+            }
+        if any(
+            keyword in combined_text
+            for keyword in ("tutorial", "course", "how to", "guide", "walkthrough", "lesson", "explained", "learn")
+        ):
+            return {
+                "intent": "learning",
+                "confidence": 0.9,
+                "reason": "youtube tutorial context",
+            }
 
     scores: dict[str, int] = {}
     evidence_by_intent: dict[str, list[str]] = {}

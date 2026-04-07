@@ -5,14 +5,14 @@ from backend.feature_mapper import categorize_app
 
 
 class ContextEngineTests(unittest.TestCase):
-    def test_youtube_tutorial_is_learning_and_maps_to_coding(self) -> None:
+    def test_youtube_tutorial_is_learning_and_maps_to_learning(self) -> None:
         context = analyze_context("brave.exe", "How to build FastAPI tutorial - YouTube - Brave")
 
         self.assertEqual(context["intent"], "learning")
         self.assertGreaterEqual(context["confidence"], 0.6)
         self.assertEqual(
             categorize_app("brave.exe", "How to build FastAPI tutorial - YouTube - Brave"),
-            "coding",
+            "learning",
         )
 
     def test_youtube_shorts_is_distraction(self) -> None:

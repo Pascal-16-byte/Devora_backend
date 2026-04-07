@@ -4,7 +4,6 @@ Map raw machine activity into the existing Devora ML feature schema.
 
 from __future__ import annotations
 
-import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -37,6 +36,7 @@ APP_RULES = {
         "docker",
         "postman",
     ],
+    "learning": ["udemy", "coursera", "khan academy", "edx"],
     "distraction": [
         "youtube",
         "netflix",
@@ -87,6 +87,16 @@ TITLE_HINTS = {
         ".ts",
         ".java",
     ],
+    "learning": [
+        "tutorial",
+        "course",
+        "learn",
+        "how to",
+        "lecture",
+        "explained",
+        "full guide",
+        "crash course",
+    ],
     "distraction": [
         "youtube",
         "netflix",
@@ -121,6 +131,17 @@ DOMAIN_RULES = {
         "localhost",
         "127.0.0.1",
     ],
+    "learning": [
+        "udemy",
+        "coursera",
+        "khanacademy",
+        "edx",
+        "freecodecamp",
+        "w3schools",
+        "developer.mozilla",
+        "docs.python",
+        "readthedocs",
+    ],
     "distraction": [
         "youtube",
         "netflix",
@@ -148,7 +169,10 @@ DOMAIN_RULES = {
 
 DEBUG_KEYWORDS = ["bug", "issue", "error", "traceback", "debug", "exception", "fix"]
 DEFAULT_SLEEP_HOURS = float(os.getenv("DEVINSIGHT_DEFAULT_SLEEP_HOURS", "7.0"))
-DOMAIN_PRIORITY = ("coding", "communication", "distraction")
+DOMAIN_PRIORITY = ("coding", "learning", "communication", "distraction")
+SHORT_FORM_VIDEO_HINTS = ("shorts", "#shorts", "/shorts/", "reels", "short video")
+ENTERTAINMENT_VIDEO_HINTS = ("montage", "highlights", "gameplay", "trailer", "compilation", "meme", "funny")
+LEARNING_VIDEO_HINTS = ("tutorial", "learn", "course", "explained", "walkthrough", "lesson", "guide")
 
 
 def _normalize(text: str | None) -> str:
@@ -181,11 +205,25 @@ def _best_scored_category(text: str, rule_map: dict[str, list[str]]) -> str | No
 def categorize_app(app_name: str | None, window_title: str | None = None) -> str:
     normalized_app = _normalize(app_name)
     normalized_title = _normalize(window_title)
+    domain_context = extract_domain_from_title(normalized_title) if is_browser_app(normalized_app) else ""
+
+    # --- HARD OVERRIDES (highest priority) ---
+    if any(keyword in normalized_title for keyword in SHORT_FORM_VIDEO_HINTS):
+        return "distraction"
+
+    if domain_context == "youtube" and any(word in normalized_title for word in ENTERTAINMENT_VIDEO_HINTS):
+        return "distraction"
+
+    if domain_context == "youtube" and any(word in normalized_title for word in LEARNING_VIDEO_HINTS):
+        return "learning"
+
     context = analyze_context(normalized_app, normalized_title)
     intent = context.get("intent")
 
-    if intent in {"coding", "learning"}:
+    if intent == "coding":
         return "coding"
+    if intent == "learning":
+        return "learning"
     if intent == "distraction":
         return "distraction"
     if intent == "communication":
@@ -196,7 +234,11 @@ def categorize_app(app_name: str | None, window_title: str | None = None) -> str
             return category
 
     if is_browser_app(normalized_app):
-        domain_context = extract_domain_from_title(normalized_title)
+        if domain_context == "youtube":
+            title_category = _best_scored_category(normalized_title, TITLE_HINTS)
+            if title_category:
+                return title_category
+
         domain_category = _best_scored_category(domain_context, DOMAIN_RULES)
         if domain_category:
             return domain_category
@@ -205,11 +247,12 @@ def categorize_app(app_name: str | None, window_title: str | None = None) -> str
         if title_category:
             return title_category
 
-        return "other"
-
     title_category = _best_scored_category(normalized_title, TITLE_HINTS)
     if title_category:
         return title_category
+
+    if is_browser_app(normalized_app):
+        return "distraction"
 
     return "other"
 
@@ -233,12 +276,19 @@ class SessionFeatureState:
     context_switches: int = 0
     distraction_switches: int = 0
     last_app_name: str | None = None
+    last_window_identity: str | None = None
     app_usage_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
     category_usage_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
     intent_usage_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
 
 
-def update_session_state(state: SessionFeatureState, snapshot: dict[str, Any], elapsed_seconds: float) -> SessionFeatureState:
+def update_session_state(
+    state: SessionFeatureState,
+    snapshot: dict[str, Any],
+    elapsed_seconds: float,
+    *,
+    window_identity: str | None = None,
+) -> SessionFeatureState:
     app_name = snapshot.get("app_name") or "Unknown"
     window_title = snapshot.get("window_title") or ""
     category = snapshot.get("category") or categorize_app(app_name, window_title)
@@ -259,11 +309,13 @@ def update_session_state(state: SessionFeatureState, snapshot: dict[str, Any], e
     else:
         state.active_seconds += elapsed_seconds
 
-    if state.last_app_name and state.last_app_name != app_name:
+    current_window_identity = f"{_normalize(app_name)}::{_normalize(window_identity or window_title or app_name)}"
+    if state.last_window_identity and state.last_window_identity != current_window_identity:
         state.context_switches += 1
-        if category == "distraction":
+        if category == "distraction" or intent == "distraction":
             state.distraction_switches += 1
 
+    state.last_window_identity = current_window_identity
     state.last_app_name = app_name
     state.app_usage_seconds[app_name] += elapsed_seconds
     state.category_usage_seconds[category] += elapsed_seconds
@@ -271,6 +323,8 @@ def update_session_state(state: SessionFeatureState, snapshot: dict[str, Any], e
 
     if category == "coding":
         state.coding_seconds += elapsed_seconds
+    elif category == "learning":
+        state.learning_seconds += elapsed_seconds
     elif category == "distraction":
         state.distraction_seconds += elapsed_seconds
     elif category == "communication":
@@ -278,7 +332,7 @@ def update_session_state(state: SessionFeatureState, snapshot: dict[str, Any], e
     else:
         state.other_seconds += elapsed_seconds
 
-    if intent == "learning":
+    if intent == "learning" and category != "learning":
         state.learning_seconds += elapsed_seconds
 
     if intent == "distraction":

@@ -206,7 +206,7 @@ def init_db() -> None:
 
 
 def _json_dump(value: Any) -> str:
-    return json.dumps(value or {}, ensure_ascii=True)
+    return json.dumps({} if value is None else value, ensure_ascii=True)
 
 
 def save_prediction(data: dict[str, Any]) -> str:
