@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -111,16 +111,13 @@ def _resolve_allowed_origins() -> list[str]:
         if origins:
             return origins
 
-    return [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ]
+    # Temporary debugging default: allow every origin until frontend/backend
+    # deployment origins are finalized.
+    return ["*"]
 
 
 ALLOWED_ORIGINS = _resolve_allowed_origins()
-ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
+ALLOW_CREDENTIALS = os.getenv("DEVORA_ALLOW_CREDENTIALS", "false").strip().lower() == "true"
 
 
 @asynccontextmanager
@@ -191,15 +188,17 @@ ws_manager = ConnectionManager()
 
 
 @app.middleware("http")
-async def add_request_timing(request, call_next):
+async def add_request_timing(request: Request, call_next):
     started_at = time.perf_counter()
+    origin = request.headers.get("origin", "-")
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
     response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
     LOGGER.info(
-        "request path=%s method=%s status=%s duration_ms=%.2f",
+        "request path=%s method=%s origin=%s status=%s duration_ms=%.2f",
         request.url.path,
         request.method,
+        origin,
         response.status_code,
         elapsed_ms,
     )
@@ -1223,6 +1222,11 @@ async def realtime_predict(payload: RealtimePredictRequest, background_tasks: Ba
     return await _handle_realtime_predict(payload, background_tasks)
 
 
+@app.options("/realtime/predict", include_in_schema=False)
+async def realtime_predict_options() -> Response:
+    return Response(status_code=204)
+
+
 @app.post("/predict/realtime", response_model=PredictionResponse, tags=["prediction"])
 async def predict_realtime_alias(payload: RealtimePredictRequest, background_tasks: BackgroundTasks):
     return await _handle_realtime_predict(payload, background_tasks)
@@ -1244,6 +1248,11 @@ async def _handle_activity_log(snapshot: ActivitySnapshot):
 @app.post("/activity/logs", tags=["realtime"])
 async def ingest_activity_log(snapshot: ActivitySnapshot):
     return await _handle_activity_log(snapshot)
+
+
+@app.options("/activity/logs", include_in_schema=False)
+async def ingest_activity_log_options() -> Response:
+    return Response(status_code=204)
 
 
 @app.post("/activity", tags=["realtime"])
@@ -1279,6 +1288,11 @@ def create_tracking_session():
         started_at=started_at,
         status="tracking",
     )
+
+
+@app.options("/tracking/session", include_in_schema=False)
+def create_tracking_session_options() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/tracking/session", response_model=TrackingSessionStatusResponse, tags=["realtime"])
