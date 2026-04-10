@@ -1313,10 +1313,15 @@ def stop_tracking_session(tracker_id: str):
     _cleanup_inactive_trackers()
 
     if tracker_id not in active_trackers:
-        raise HTTPException(status_code=404, detail="Tracker process not found")
+        return {"tracker_id": tracker_id, "status": "stopped"}
 
     _stop_tracker_process(tracker_id)
     return {"tracker_id": tracker_id, "status": "stopped"}
+
+
+@app.post("/tracking/session/stop/{tracker_id}", tags=["realtime"])
+def stop_tracking_session_alias(tracker_id: str):
+    return stop_tracking_session(tracker_id)
 
 
 @app.get("/realtime/overview", response_model=RealtimeOverviewResponse, tags=["realtime"])
