@@ -15,11 +15,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import platform
 import re
 import sqlite3
 import subprocess
 from shutil import which
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -31,6 +33,8 @@ from uuid import uuid4
 
 import psutil
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     import win32gui
@@ -63,13 +67,76 @@ except ImportError:
         update_session_state,
     )
 
-BASE_DIR = Path(__file__).resolve().parent
-LOCAL_DB_PATH = BASE_DIR / "tracker_local.db"
-LOCAL_JSON_PATH = BASE_DIR / "tracker_predictions.jsonl"
-DEFAULT_API_BASE = "http://127.0.0.1:8000"
+APP_NAME = "DevoraTracker"
+DEFAULT_API_BASE = "https://devora-backend-bo7f.onrender.com"
 LOGGER = logging.getLogger("tracker")
 UNKNOWN_WINDOW_INFO: tuple[str, str, int | None] = ("Unknown", "Unknown Window", None)
 _LAST_WINDOW_INFO: tuple[str, str, int | None] = UNKNOWN_WINDOW_INFO
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _app_state_dir() -> Path:
+    if platform.system() == "Windows":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            path = Path(local_app_data) / APP_NAME
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+    base_dir = Path(sys.executable).resolve().parent if _is_frozen() else Path(__file__).resolve().parent
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+APP_STATE_DIR = _app_state_dir()
+LOCAL_DB_PATH = APP_STATE_DIR / "tracker_local.db"
+LOCAL_JSON_PATH = APP_STATE_DIR / "tracker_predictions.jsonl"
+LOG_PATH = APP_STATE_DIR / "tracker.log"
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+        force=True,
+    )
+
+
+def build_requests_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def install_startup_task(startup_name: str, launch_command: str) -> None:
+    if platform.system() != "Windows":
+        LOGGER.warning("Startup installation is only implemented for Windows.")
+        return
+
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0,
+        winreg.KEY_SET_VALUE,
+    ) as key:
+        winreg.SetValueEx(key, startup_name, 0, winreg.REG_SZ, launch_command)
 
 
 class InputActivityMonitor:
@@ -234,6 +301,8 @@ class TrackerConfig:
     idle_threshold_seconds: float = 120.0
     focus_delta_threshold: float = 5.0
     privacy_enabled: bool = True
+    startup_name: str = APP_NAME
+    install_startup: bool = False
     tracker_id: str = field(default_factory=lambda: uuid4().hex[:12])
 
     def __post_init__(self) -> None:
@@ -508,6 +577,19 @@ def send_json(
         return False, None
 
 
+def _build_launch_command(config: TrackerConfig) -> str:
+    executable = Path(sys.executable).resolve() if _is_frozen() else Path(__file__).resolve()
+    command_parts = [f'"{executable}"']
+    command_parts.append(f'--api_base_url "{config.api_base_url}"')
+    command_parts.append(f"--sample-interval {config.sample_interval_seconds}")
+    command_parts.append(f"--send-interval {config.send_interval_seconds}")
+    command_parts.append(f"--idle-threshold {config.idle_threshold_seconds}")
+    command_parts.append(f"--tracker_id {config.tracker_id}")
+    if not config.privacy_enabled:
+        command_parts.append("--disable-privacy")
+    return " ".join(command_parts)
+
+
 def _build_activity_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "tracker_id": snapshot.get("tracker_id"),
@@ -585,22 +667,37 @@ def should_send_update(
 
 
 def run_tracker(config: TrackerConfig) -> None:
-    print(f"[tracker] starting Devora tracker with id={config.tracker_id}")
-    print(f"[tracker] backend={config.api_base_url}, sample_interval={config.sample_interval_seconds}s, send_interval={config.send_interval_seconds}s")
+    configure_logging()
+    LOGGER.info("Starting Devora tracker id=%s", config.tracker_id)
+    LOGGER.info(
+        "Tracker config backend=%s sample_interval=%ss send_interval=%ss state_dir=%s",
+        config.api_base_url,
+        config.sample_interval_seconds,
+        config.send_interval_seconds,
+        APP_STATE_DIR,
+    )
 
     store = LocalTrackerStore()
     activity_monitor = InputActivityMonitor()
     activity_monitor.start()
     state = SessionFeatureState()
-    session = requests.Session()
+    session = build_requests_session()
     _prime_cpu_counters()
 
     last_sample_at = time.time()
     last_send_at = 0.0
+    network_backoff_seconds = 0.0
+    next_send_attempt_at = 0.0
     recent_cpu: list[float] = []
     latest_snapshot: dict[str, Any] | None = None
     last_sent_snapshot: dict[str, Any] | None = None
     last_sent_features: dict[str, Any] | None = None
+
+    if config.install_startup:
+        try:
+            install_startup_task(config.startup_name, _build_launch_command(config))
+        except OSError:
+            LOGGER.exception("Tracker startup registration failed.")
 
     try:
         while True:
@@ -618,7 +715,10 @@ def run_tracker(config: TrackerConfig) -> None:
                 avg_cpu_percent=sum(recent_cpu) / max(len(recent_cpu), 1),
             )
 
-            if latest_snapshot and should_send_update(
+            should_attempt_send = (
+                latest_snapshot is not None
+                and now >= next_send_attempt_at
+                and should_send_update(
                 last_sent_snapshot,
                 latest_snapshot,
                 last_sent_features,
@@ -626,7 +726,10 @@ def run_tracker(config: TrackerConfig) -> None:
                 seconds_since_last_send=now - last_send_at,
                 fallback_interval_seconds=config.send_interval_seconds,
                 focus_delta_threshold=config.focus_delta_threshold,
-            ):
+                )
+            )
+
+            if should_attempt_send:
                 activity_payload = _build_activity_payload(latest_snapshot)
                 activity_synced, _ = send_json(
                     session,
@@ -653,30 +756,49 @@ def run_tracker(config: TrackerConfig) -> None:
                         "activity_snapshot": latest_snapshot,
                     }
                     store.save_prediction(enriched_prediction)
-                    print(
-                        "[tracker] "
-                        f"{prediction['productivity_level']} score={prediction['productivity_score']} "
-                        f"active_app={latest_snapshot['app_name']}"
+                    LOGGER.info(
+                        "Prediction synced level=%s score=%s active_app=%s",
+                        prediction.get("productivity_level"),
+                        prediction.get("productivity_score"),
+                        latest_snapshot["app_name"],
                     )
                 if activity_synced and prediction_synced:
                     last_send_at = now
                     last_sent_snapshot = latest_snapshot
                     last_sent_features = dict(feature_payload)
+                    if network_backoff_seconds > 0:
+                        LOGGER.info("Backend connection restored.")
+                    network_backoff_seconds = 0.0
+                    next_send_attempt_at = 0.0
+                else:
+                    network_backoff_seconds = 5.0 if network_backoff_seconds == 0 else min(network_backoff_seconds * 2, 300.0)
+                    next_send_attempt_at = now + network_backoff_seconds
+                    LOGGER.warning(
+                        "Backend unreachable or partial sync failure; retrying in %.0fs",
+                        network_backoff_seconds,
+                    )
 
             time.sleep(config.sample_interval_seconds)
     except KeyboardInterrupt:
-        print("[tracker] stopping tracker")
+        LOGGER.info("Stopping tracker on keyboard interrupt.")
+    except Exception:
+        LOGGER.exception("Tracker stopped because of an unexpected error.")
+        raise
     finally:
         activity_monitor.stop()
+        session.close()
+        LOGGER.info("Tracker stopped.")
 
 
 def parse_args() -> TrackerConfig:
     parser = argparse.ArgumentParser(description="Devora realtime tracker")
-    parser.add_argument("--api-base-url", default=DEFAULT_API_BASE)
+    parser.add_argument("--api_base_url", "--api-base-url", dest="api_base_url", default=DEFAULT_API_BASE)
     parser.add_argument("--sample-interval", type=float, default=2.0)
     parser.add_argument("--send-interval", type=float, default=10.0)
     parser.add_argument("--idle-threshold", type=float, default=120.0)
     parser.add_argument("--tracker_id", default=None)
+    parser.add_argument("--install-startup", action="store_true", help="Register the tracker to run at Windows sign-in")
+    parser.add_argument("--startup-name", default=APP_NAME, help="Windows startup entry name")
     parser.add_argument("--disable-privacy", action="store_true", help="Send full window titles")
     args = parser.parse_args()
 
@@ -686,6 +808,8 @@ def parse_args() -> TrackerConfig:
         send_interval_seconds=args.send_interval,
         idle_threshold_seconds=args.idle_threshold,
         privacy_enabled=not args.disable_privacy,
+        startup_name=args.startup_name,
+        install_startup=args.install_startup,
         tracker_id=args.tracker_id or uuid4().hex[:12],
     )
 
