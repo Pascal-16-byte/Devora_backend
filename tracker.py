@@ -101,7 +101,10 @@ def configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+        handlers=[
+            logging.FileHandler(LOG_PATH, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
         force=True,
     )
 
@@ -566,15 +569,42 @@ def send_json(
     url: str,
     payload: dict[str, Any],
 ) -> tuple[bool, dict[str, Any] | None]:
-    try:
-        response = session.request(method=method, url=url, json=payload, timeout=10)
-        response.raise_for_status()
-        if response.content:
-            return True, response.json()
-        return True, None
-    except requests.RequestException as exc:
-        LOGGER.warning("Tracker sync failed method=%s url=%s error=%s", method, url, exc)
-        return False, None
+    max_attempts = 4
+    backoff_seconds = 1.0
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.request(method=method, url=url, json=payload, timeout=10)
+            response_text = response.text.strip()
+            LOGGER.info(
+                "Tracker request method=%s url=%s attempt=%s status=%s response=%s",
+                method,
+                url,
+                attempt,
+                response.status_code,
+                response_text[:1000] if response_text else "<empty>",
+            )
+            response.raise_for_status()
+            if response.content:
+                try:
+                    return True, response.json()
+                except ValueError:
+                    return True, {"raw_response": response_text}
+            return True, None
+        except requests.RequestException as exc:
+            LOGGER.warning(
+                "Tracker request failed method=%s url=%s attempt=%s error=%s",
+                method,
+                url,
+                attempt,
+                exc,
+            )
+            if attempt == max_attempts:
+                return False, None
+            time.sleep(backoff_seconds)
+            backoff_seconds *= 2
+
+    return False, None
 
 
 def _build_launch_command(config: TrackerConfig) -> str:
@@ -734,7 +764,7 @@ def run_tracker(config: TrackerConfig) -> None:
                 activity_synced, _ = send_json(
                     session,
                     "POST",
-                    f"{config.api_base_url}/activity/logs",
+                    f"{config.api_base_url}/activity",
                     activity_payload,
                 )
                 predict_payload = {
@@ -745,7 +775,7 @@ def run_tracker(config: TrackerConfig) -> None:
                 prediction_synced, prediction = send_json(
                     session,
                     "POST",
-                    f"{config.api_base_url}/realtime/predict",
+                    f"{config.api_base_url}/predict/realtime",
                     predict_payload,
                 )
                 if prediction_synced and prediction:

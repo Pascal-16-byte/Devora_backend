@@ -1197,8 +1197,10 @@ async def batch_predict(payloads: list[BatchPredictItem], background_tasks: Back
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/realtime/predict", response_model=PredictionResponse, tags=["prediction"])
-async def realtime_predict(payload: RealtimePredictRequest, background_tasks: BackgroundTasks):
+async def _handle_realtime_predict(
+    payload: RealtimePredictRequest,
+    background_tasks: BackgroundTasks,
+) -> PredictionResponse:
     try:
         metrics = ProgrammerMetrics(**payload.model_dump(include=set(ProgrammerMetrics.model_fields.keys())))
         response = await asyncio.to_thread(
@@ -1216,8 +1218,17 @@ async def realtime_predict(payload: RealtimePredictRequest, background_tasks: Ba
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/activity/logs", tags=["realtime"])
-async def ingest_activity_log(snapshot: ActivitySnapshot):
+@app.post("/realtime/predict", response_model=PredictionResponse, tags=["prediction"])
+async def realtime_predict(payload: RealtimePredictRequest, background_tasks: BackgroundTasks):
+    return await _handle_realtime_predict(payload, background_tasks)
+
+
+@app.post("/predict/realtime", response_model=PredictionResponse, tags=["prediction"])
+async def predict_realtime_alias(payload: RealtimePredictRequest, background_tasks: BackgroundTasks):
+    return await _handle_realtime_predict(payload, background_tasks)
+
+
+async def _handle_activity_log(snapshot: ActivitySnapshot):
     try:
         payload = snapshot.model_dump()
         payload["timestamp"] = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
@@ -1228,6 +1239,16 @@ async def ingest_activity_log(snapshot: ActivitySnapshot):
         return {"status": "ok", "id": record_id}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/activity/logs", tags=["realtime"])
+async def ingest_activity_log(snapshot: ActivitySnapshot):
+    return await _handle_activity_log(snapshot)
+
+
+@app.post("/activity", tags=["realtime"])
+async def ingest_activity_log_alias(snapshot: ActivitySnapshot):
+    return await _handle_activity_log(snapshot)
 
 
 @app.post("/tracking/session", response_model=TrackingSessionResponse, tags=["realtime"])
